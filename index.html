@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Voice Navigator (free)</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+  :root{--bg:#0f1b2d;--ink:#fff;--accent:#ffd23f;--mute:#9fb0c8}
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,Arial,sans-serif}
+  body{display:flex;flex-direction:column}
+  #map{flex:1;min-height:0}
+  #panel{padding:12px 14px 16px;display:grid;gap:10px}
+  #status{font-size:1.25rem;line-height:1.35;min-height:3.4em}
+  #stats{color:var(--mute);font-size:.95rem}
+  button{font:inherit;border:2px solid var(--accent);background:transparent;color:var(--accent);border-radius:12px;padding:12px;min-height:48px}
+  #talk{background:var(--accent);color:var(--bg);font-size:1.4rem;font-weight:700;min-height:76px}
+  .row{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+  button:focus-visible{outline:3px solid #fff;outline-offset:2px}
+</style>
+</head>
+<body>
+<div id="map" aria-label="Map"></div>
+<div id="panel">
+  <div id="status" aria-live="polite">Tap the big button, or press Space, and say where you want to go.</div>
+  <div id="stats"></div>
+  <button id="talk">Speak destination</button>
+  <div class="row">
+    <button id="repeat">Repeat</button>
+    <button id="demo">Demo walk</button>
+    <button id="stop">Stop</button>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+// Free public services, no account or key needed. They are fair-use servers meant for testing.
+const ROUTE_BASE = "https://routing.openstreetmap.de/routed-foot/route/v1/";
+const PROFILES = ["driving", "foot"]; // this foot server wants "driving" in the URL; "foot" is the fallback
+
+let map, me, line, path = [], steps = [], si = 0, dest = "", watchId = null, simTimer = null, spoken = {}, rerouting = false;
+const $ = id => document.getElementById(id);
+
+// ---------- Voice out / in ----------
+function say(text) {
+  return new Promise(done => {
+    $('status').textContent = text;
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = 'en-IN'; u.onend = done; u.onerror = done;
+    speechSynthesis.speak(u);
+  });
+}
+function listen() {
+  return new Promise(res => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) { res(''); return; }
+    const r = new SR();
+    r.lang = 'en-IN';
+    r.onresult = e => res(e.results[0][0].transcript);
+    r.onerror = () => res(''); r.onend = () => res('');
+    r.start();
+  });
+}
+
+// ---------- Helpers ----------
+function getPos() {
+  return new Promise((ok, no) => navigator.geolocation.getCurrentPosition(
+    p => ok({ lat: p.coords.latitude, lng: p.coords.longitude }), no, { enableHighAccuracy: true }));
+}
+const meters = (a, b) => map.distance([a.lat, a.lng], [b.lat, b.lng]);
+function segDist(p, a, b) { // distance in meters from point p to segment a-b, all [lat,lng]
+  const k = Math.cos(p[0] * Math.PI / 180), X = q => [q[1] * k * 111320, q[0] * 110540];
+  const P = X(p), A = X(a), B = X(b), dx = B[0] - A[0], dy = B[1] - A[1], l = dx * dx + dy * dy;
+  let t = l ? ((P[0] - A[0]) * dx + (P[1] - A[1]) * dy) / l : 0;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(P[0] - A[0] - t * dx, P[1] - A[1] - t * dy);
+}
+function text(s) { // turn an OSRM step into a spoken instruction
+  const m = s.maneuver, mod = m.modifier || '', road = s.name ? ' onto ' + s.name : '';
+  if (m.type === 'depart') return 'Start walking' + (s.name ? ' on ' + s.name : '');
+  if (m.type === 'arrive') return 'You have arrived at your destination';
+  if (mod === 'uturn') return 'Make a U-turn';
+  if (mod === 'straight' || (!mod && m.type === 'continue')) return 'Go straight' + (s.name ? ' on ' + s.name : '');
+  if (m.type === 'roundabout' || m.type === 'rotary') return 'Enter the roundabout and take exit ' + (m.exit || 1);
+  if (mod.includes('slight')) return 'Bear ' + mod.replace('slight ', '') + road;
+  return 'Turn ' + mod + road;
+}
+const withDist = s => text(s) + (s.maneuver.type === 'arrive' ? '' : ', then walk ' + Math.round(s.distance) + ' meters');
+const target = i => { const l = steps[i].maneuver.location; return { lat: l[1], lng: l[0] }; }; // [lon,lat] -> lat/lng
+
+// ---------- Conversation ----------
+async function askDestination() {
+  stopNav();
+  await say("Where do you want to go?");
+  const d = await listen();
+  if (!d) { await say("I did not hear you. Tap the button and try again."); return; }
+  await say("You said " + d + ". Say yes to start, or no to cancel.");
+  if (!(await listen()).toLowerCase().includes('yes')) { await say("Cancelled."); return; }
+  startRoute(d);
+}
+
+// ---------- Search + route ----------
+async function geocode(q, o) {
+  const v = 0.5; // prefer places within about 50 km of you
+  const u = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(q)}` +
+            `&viewbox=${o.lng - v},${o.lat + v},${o.lng + v},${o.lat - v}`;
+  const r = await (await fetch(u)).json();
+  return r[0] ? { lat: +r[0].lat, lng: +r[0].lon } : null;
+}
+async function fetchRoute(o, d) {
+  for (const pf of PROFILES) {
+    try {
+      const u = `${ROUTE_BASE}${pf}/${o.lng},${o.lat};${d.lng},${d.lat}?overview=full&geometries=geojson&steps=true`;
+      const j = await (await fetch(u)).json();
+      if (j.code === 'Ok') return j.routes[0];
+    } catch (e) { /* try next profile */ }
+  }
+  return null;
+}
+async function startRoute(q, origin) {
+  dest = q;
+  try { origin = origin || await getPos(); }
+  catch (e) { await say("I cannot get your location. Please allow location access."); return; }
+  const place = await geocode(q, origin).catch(() => null);
+  if (!place) { rerouting = false; await say("I could not find " + q + ". Try a more specific name."); return; }
+  const r = await fetchRoute(origin, place);
+  rerouting = false;
+  if (!r) { await say("I could not get a walking route. The routing server may be busy."); return; }
+  path = r.geometry.coordinates.map(c => [c[1], c[0]]);
+  line.setLatLngs(path); map.fitBounds(line.getBounds());
+  steps = r.legs[0].steps; si = 0; spoken = {};
+  await say("Route found. " + Math.round(r.distance) + " meters, about " + Math.round(r.duration / 60) + " minutes. " + withDist(steps[0]));
+  track();
+}
+
+// ---------- Live tracking ----------
+function track() {
+  if (!navigator.geolocation) return;
+  if (navigator.wakeLock) navigator.wakeLock.request('screen').catch(() => {}); // keep screen on so GPS keeps running
+  watchId = navigator.geolocation.watchPosition(p => {
+    const c = p.coords;
+    onPos({ lat: c.latitude, lng: c.longitude });
+    const kmh = c.speed != null ? (c.speed * 3.6).toFixed(1) : '-';
+    const hd = c.heading != null && !isNaN(c.heading) ? Math.round(c.heading) + ' deg' : '-';
+    $('stats').textContent = 'Speed ' + kmh + ' km/h, heading ' + hd + ', accuracy ' + Math.round(c.accuracy) + ' m';
+  }, () => say("Location signal lost."), { enableHighAccuracy: true, maximumAge: 1000 });
+}
+function onPos(p) {
+  me.setLatLng([p.lat, p.lng]); map.panTo([p.lat, p.lng]);
+  if (!steps.length || si >= steps.length - 1) return;
+  const next = steps[si + 1], d = meters(p, target(si + 1));
+  if (next.maneuver.type === 'arrive' && d < 15) { say("You have arrived at your destination."); stopNav(true); return; }
+  if (d < 20) { si++; say("Now, " + withDist(next)); return; }
+  if (d < 60 && !spoken[si]) { spoken[si] = 1; say("In " + Math.round(d) + " meters, " + text(next)); }
+  let best = Infinity;
+  for (let i = 0; i < path.length - 1; i++) best = Math.min(best, segDist([p.lat, p.lng], path[i], path[i + 1]));
+  if (!rerouting && best > 50) {
+    rerouting = true;
+    say("You are off the route. Finding a new way.").then(() => startRoute(dest, p));
+  }
+}
+
+// ---------- Demo walk (laptops have no real GPS) ----------
+function demo() {
+  if (!path.length) { say("Set a destination first."); return; }
+  if (watchId !== null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
+  clearInterval(simTimer);
+  const pts = [];
+  for (let i = 0; i < path.length - 1; i++) {
+    const a = path[i], b = path[i + 1], n = Math.max(1, Math.floor(meters({ lat: a[0], lng: a[1] }, { lat: b[0], lng: b[1] }) / 8));
+    for (let k = 0; k < n; k++) pts.push({ lat: a[0] + (b[0] - a[0]) * k / n, lng: a[1] + (b[1] - a[1]) * k / n });
+  }
+  const end = path[path.length - 1]; pts.push({ lat: end[0], lng: end[1] });
+  let i = 0;
+  simTimer = setInterval(() => { if (i >= pts.length) clearInterval(simTimer); else onPos(pts[i++]); }, 500);
+}
+function stopNav(keep) {
+  if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+  watchId = null; clearInterval(simTimer); speechSynthesis.cancel();
+  if (!keep) { steps = []; path = []; line.setLatLngs([]); }
+}
+
+// ---------- Start ----------
+map = L.map('map', { zoomControl: true }).setView([20.59, 78.96], 5);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
+line = L.polyline([], { color: '#1a73e8', weight: 6 }).addTo(map);
+me = L.circleMarker([0, 0], { radius: 9, color: '#0f1b2d', weight: 3, fillColor: '#ffd23f', fillOpacity: 1 }).addTo(map);
+getPos().then(p => { map.setView([p.lat, p.lng], 17); me.setLatLng([p.lat, p.lng]); }).catch(() => {});
+
+$('talk').onclick = askDestination;
+$('repeat').onclick = () => steps.length && say(withDist(steps[si]));
+$('demo').onclick = demo;
+$('stop').onclick = () => { stopNav(); say("Navigation stopped."); };
+document.addEventListener('keydown', e => { if (e.code === 'Space' && e.target.tagName !== 'BUTTON') { e.preventDefault(); askDestination(); } });
+</script>
+</body>
+</html>
